@@ -16,6 +16,7 @@ import {
   findPluginRoot,
   type HookManifest,
 } from "./codex-hooks.js";
+import { DEFAULT_REST_URL } from "../../constants/network.js";
 
 const CODEX_DIR = join(homedir(), ".codex");
 const CODEX_TOML = join(CODEX_DIR, "config.toml");
@@ -26,7 +27,7 @@ command = "npx"
 args = ["-y", "@agentmemory/mcp"]
 
 [mcp_servers.agentmemory.env]
-AGENTMEMORY_URL = "http://localhost:3111"
+AGENTMEMORY_URL = "${DEFAULT_REST_URL}"
 `;
 
 const SECTION_HEADER = "[mcp_servers.agentmemory]";

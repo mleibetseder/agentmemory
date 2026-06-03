@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { DEFAULT_ENGINE_WS_URL } from "./constants/network.js";
 import type {
   AgentMemoryConfig,
   ProviderConfig,
@@ -162,7 +163,7 @@ export function loadConfig(): AgentMemoryConfig {
   const provider = detectProvider(env);
 
   return {
-    engineUrl: env["III_ENGINE_URL"] || "ws://localhost:49134",
+    engineUrl: env["III_ENGINE_URL"] || DEFAULT_ENGINE_WS_URL,
     restPort: parseInt(env["III_REST_PORT"] || "3111", 10) || 3111,
     streamsPort: parseInt(env["III_STREAMS_PORT"] || "3112", 10) || 3112,
     provider,

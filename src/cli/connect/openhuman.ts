@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import * as p from "@clack/prompts";
 import type { ConnectAdapter, ConnectOptions, ConnectResult } from "./types.js";
+import { DEFAULT_REST_URL } from "../../constants/network.js";
 
 const OPENHUMAN_DIR = join(homedir(), ".openhuman");
 const DOCS = "https://github.com/tinyhumansai/openhuman";
@@ -12,7 +13,7 @@ export const adapter: ConnectAdapter = {
   displayName: "OpenHuman",
   docs: DOCS,
   protocolNote:
-    "→ Using native hooks (REST API at :3111). MCP not required.",
+    `→ Using native hooks (REST API at :${DEFAULT_REST_URL.split(":").pop()}). MCP not required.`,
 
   detect(): boolean {
     return existsSync(OPENHUMAN_DIR);
@@ -25,7 +26,7 @@ export const adapter: ConnectAdapter = {
     p.note(
       [
         "OpenHuman is a Memory-trait host. The expected wiring is the REST",
-        "proxy at http://localhost:3111 plus an OpenHuman-side Memory trait",
+        `proxy at ${DEFAULT_REST_URL} plus an OpenHuman-side Memory trait`,
         "impl. Once integrations/openhuman/ lands in agentmemory we'll wire",
         "this up automatically.",
         "",

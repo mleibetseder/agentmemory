@@ -41,8 +41,11 @@ import {
 import { renderSplash } from "./cli/splash.js";
 import { isFirstRun, readPrefs, resetPrefs, writePrefs } from "./cli/preferences.js";
 import { runOnboarding } from "./cli/onboarding.js";
-import { setBootVerbose } from "./logger.js";
-import { VERSION } from "./version.js";
+import {
+  DEFAULT_REST_URL,
+  DEFAULT_VIEWER_URL,
+  DEFAULT_ENGINE_WS_URL,
+} from "./constants/network.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
@@ -157,7 +160,7 @@ Options:
   --port <N>         Override REST port (default: 3111)
 
 Environment:
-  AGENTMEMORY_URL              Full REST base URL (e.g. http://localhost:3111).
+  AGENTMEMORY_URL              Full REST base URL (e.g. ${DEFAULT_REST_URL}).
                                Honored by status, doctor, and MCP shim commands.
   AGENTMEMORY_USE_DOCKER=1     Prefer the bundled docker-compose path over the
                                native iii-engine binary on first run.
@@ -195,13 +198,15 @@ function getRestPort(): number {
       if (parsed) return parseInt(parsed, 10);
     } catch {}
   }
-  return parseInt(process.env["III_REST_PORT"] || "3111", 10) || 3111;
+  const defaultPort = new URL(DEFAULT_REST_URL).port;
+  return parseInt(process.env["III_REST_PORT"] || defaultPort, 10);
 }
 
 function getBaseUrl(): string {
   const url = process.env["AGENTMEMORY_URL"];
   if (url) return url.replace(/\/+$/, "");
-  return `http://localhost:${getRestPort()}`;
+  const u = new URL(DEFAULT_REST_URL);
+  return `${u.protocol}//${u.hostname}:${getRestPort()}`;
 }
 
 let discoveredViewerPort: number | null = null;
@@ -225,26 +230,29 @@ function getViewerUrl(): string {
   const envUrl = process.env["AGENTMEMORY_VIEWER_URL"];
   if (envUrl) return envUrl.replace(/\/+$/, "");
   
+  const defaultViewer = new URL(DEFAULT_VIEWER_URL);
+
   if (discoveredViewerPort !== null) {
     try {
       const u = new URL(getBaseUrl());
       return `${u.protocol}//${u.hostname}:${discoveredViewerPort}`;
     } catch {
-      return `http://localhost:${discoveredViewerPort}`;
+      return `${defaultViewer.protocol}//${defaultViewer.hostname}:${discoveredViewerPort}`;
     }
   }
   
   try {
     const u = new URL(getBaseUrl());
+    const defaultRestPort = new URL(DEFAULT_REST_URL).port;
     const vPort =
       parseInt(process.env["III_VIEWER_PORT"] || "", 10) ||
-      (parseInt(u.port || "3111", 10) || 3111) + 2;
+      (parseInt(u.port || defaultRestPort, 10) || parseInt(defaultRestPort, 10)) + 2;
     return `${u.protocol}//${u.hostname}:${vPort}`;
   } catch {
     const vPort =
       parseInt(process.env["III_VIEWER_PORT"] || "", 10) ||
       getRestPort() + 2;
-    return `http://localhost:${vPort}`;
+    return `${defaultViewer.protocol}//${defaultViewer.hostname}:${vPort}`;
   }
 }
 
@@ -274,7 +282,7 @@ function getEnginePort(): number {
       if (parsed) return parseInt(parsed, 10);
     } catch {}
   }
-  return 49134;
+  return parseInt(new URL(DEFAULT_ENGINE_WS_URL).port, 10);
 }
 
 async function isEngineRunning(): Promise<boolean> {
@@ -978,7 +986,7 @@ function getEngineHost(): string {
       if (parsed.hostname) return parsed.hostname;
     } catch {}
   }
-  return "localhost";
+  return new URL(DEFAULT_ENGINE_WS_URL).hostname;
 }
 
 function printReadyHint(consoleState: IiiConsoleState): void {
@@ -1945,7 +1953,8 @@ async function runInit() {
 
 async function runDemo() {
   const port = getRestPort();
-  const base = `http://localhost:${port}`;
+  const u = new URL(DEFAULT_REST_URL);
+  const base = `${u.protocol}//${u.hostname}:${port}`;
   p.intro("agentmemory demo");
 
   if (!(await isAgentmemoryReady())) {
@@ -2395,7 +2404,8 @@ async function runImportJsonl(): Promise<void> {
   const pathArg = positional[0];
 
   const port = getRestPort();
-  const base = `http://localhost:${port}`;
+  const u = new URL(DEFAULT_REST_URL);
+  const base = `${u.protocol}//${u.hostname}:${port}`;
 
   let probeOk = false;
   let probeDetail = "";

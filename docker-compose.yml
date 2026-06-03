@@ -28,9 +28,15 @@ services:
     depends_on:
       iii-init:
         condition: service_completed_successfully
+    environment:
+      - HOST=${HOST:-0.0.0.0}
+      - PORT=${PORT:-3111}
+      - VIEWER_PORT=${VIEWER_PORT:-3113}
+      - AGENTMEMORY_URL=${AGENTMEMORY_URL:-http://localhost:3111}
     ports:
+      - "${HOST:-127.0.0.1}:${PORT:-3111}:${PORT:-3111}"
+      - "${HOST:-127.0.0.1}:${VIEWER_PORT:-3113}:${VIEWER_PORT:-3113}"
       - "127.0.0.1:49134:49134"
-      - "127.0.0.1:3111:3111"
       - "127.0.0.1:3112:3112"
       - "127.0.0.1:9464:9464"
     volumes:

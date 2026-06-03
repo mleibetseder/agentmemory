@@ -6,6 +6,7 @@ import { getAllTools } from "./tools-registry.js";
 import { getStandalonePersistPath } from "../config.js";
 import { VERSION } from "../version.js";
 import { generateId } from "../state/schema.js";
+import { DEFAULT_REST_URL } from "../constants/network.js";
 import {
   resolveHandle,
   invalidateHandle,
@@ -38,7 +39,7 @@ function displayAgentmemoryUrl(): string {
   // placeholder through unexpanded.
   const raw = process.env["AGENTMEMORY_URL"];
   if (!raw || (raw.startsWith("${") && raw.endsWith("}"))) {
-    return "http://localhost:3111";
+    return DEFAULT_REST_URL;
   }
   return raw;
 }
