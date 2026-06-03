@@ -1446,7 +1446,33 @@ export function registerApiTriggers(
     config: { api_path: "/agentmemory/graph/stats", http_method: "GET" },
   });
 
-  sdk.registerFunction("api::graph-extract", 
+  // #814: explicit snapshot rebuild endpoint. Pays the full graph
+  // enumeration once and persists a top-degree subgraph + aggregate
+  // counts so subsequent /graph/query and /graph/stats calls skip the
+  // unbounded kv.list. Operator-grade endpoint exposed for the viewer
+  // banner action and CLI repair.
+  sdk.registerFunction("api::graph-snapshot-rebuild",
+    async (req: ApiRequest): Promise<Response> => {
+      const authErr = checkAuth(req, secret);
+      if (authErr) return authErr;
+      try {
+        const result = await sdk.trigger({
+          function_id: "mem::graph-snapshot-rebuild",
+          payload: {},
+        });
+        return { status_code: 200, body: result };
+      } catch {
+        return graphDisabledResponse();
+      }
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::graph-snapshot-rebuild",
+    config: { api_path: "/agentmemory/graph/snapshot-rebuild", http_method: "POST" },
+  });
+
+  sdk.registerFunction("api::graph-extract",
     async (req: ApiRequest<{ observations: unknown[] }>): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;

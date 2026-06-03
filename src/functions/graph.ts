@@ -3,6 +3,7 @@ import type {
   GraphNode,
   GraphEdge,
   GraphQueryResult,
+  GraphSnapshot,
   CompressedObservation,
   MemoryProvider,
 } from "../types.js";
@@ -22,6 +23,148 @@ import { logger } from "../logger.js";
 // fan out faster than nodes.
 const DEFAULT_GRAPH_QUERY_LIMIT = 500;
 const MAX_GRAPH_QUERY_LIMIT = 5000;
+
+// #814: the precomputed snapshot covers the top-degree subgraph used by
+// the empty-body / nodeType-only branch — the path the viewer hits on
+// tab load. Sized to match the default query limit so the snapshot can
+// service a default-cap request without falling back to live
+// enumeration. Aggregate stats (nodesByType / edgesByType) are computed
+// fresh during rebuild and stored alongside.
+const SNAPSHOT_TOP_NODES = DEFAULT_GRAPH_QUERY_LIMIT;
+const SNAPSHOT_KEY = "current";
+
+// `state::list` over a 75K-node scope can exceed the iii invocation
+// timeout. The query handler races the enumeration against this budget
+// and falls back to the snapshot (or a warning envelope) when the live
+// path is too slow. 6000ms leaves headroom under the default 8s engine
+// invocation deadline.
+const LIVE_ENUMERATION_BUDGET_MS = 6000;
+
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(
+      () => reject(new Error(`${label}: exceeded ${ms}ms budget`)),
+      ms,
+    );
+    p.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (err) => {
+        clearTimeout(t);
+        reject(err);
+      },
+    );
+  });
+}
+
+function emptySnapshot(): GraphSnapshot {
+  return {
+    version: 1,
+    topNodes: [],
+    topEdges: [],
+    stats: {
+      totalNodes: 0,
+      totalEdges: 0,
+      nodesByType: {},
+      edgesByType: {},
+    },
+    updatedAt: new Date(0).toISOString(),
+    dirty: true,
+  };
+}
+
+async function readSnapshot(kv: StateKV): Promise<GraphSnapshot | null> {
+  try {
+    const snap = await kv.get<GraphSnapshot>(KV.graphSnapshot, SNAPSHOT_KEY);
+    if (snap && typeof snap === "object" && snap.version === 1) {
+      return snap;
+    }
+    return null;
+  } catch (err) {
+    logger.warn("Graph snapshot read failed", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
+}
+
+async function markSnapshotDirty(kv: StateKV): Promise<void> {
+  try {
+    const snap = (await readSnapshot(kv)) ?? emptySnapshot();
+    if (snap.dirty) return;
+    await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, { ...snap, dirty: true });
+  } catch (err) {
+    logger.warn("Graph snapshot dirty-mark failed", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+function buildSnapshotFromArrays(
+  nodes: GraphNode[],
+  edges: GraphEdge[],
+): GraphSnapshot {
+  const liveNodes = nodes.filter((n) => !n.stale);
+  const liveEdges = edges.filter((e) => !e.stale);
+  const ranked = rankByDegree(liveNodes, liveEdges).slice(0, SNAPSHOT_TOP_NODES);
+  const rankedIds = new Set(ranked.map((n) => n.id));
+  const topEdges = liveEdges.filter(
+    (e) => rankedIds.has(e.sourceNodeId) && rankedIds.has(e.targetNodeId),
+  );
+  const nodesByType: Record<string, number> = {};
+  for (const n of liveNodes) {
+    nodesByType[n.type] = (nodesByType[n.type] || 0) + 1;
+  }
+  const edgesByType: Record<string, number> = {};
+  for (const e of liveEdges) {
+    edgesByType[e.type] = (edgesByType[e.type] || 0) + 1;
+  }
+  return {
+    version: 1,
+    topNodes: ranked,
+    topEdges,
+    stats: {
+      totalNodes: liveNodes.length,
+      totalEdges: liveEdges.length,
+      nodesByType,
+      edgesByType,
+    },
+    updatedAt: new Date().toISOString(),
+    dirty: false,
+  };
+}
+
+function paginateFromSnapshot(
+  snap: GraphSnapshot,
+  filterType: string | undefined,
+  limit: number,
+  offset: number,
+): GraphQueryResult {
+  const filteredNodes = filterType
+    ? snap.topNodes.filter((n) => n.type === filterType)
+    : snap.topNodes;
+  const total = filterType
+    ? snap.stats.nodesByType[filterType] ?? 0
+    : snap.stats.totalNodes;
+  const pageNodes = filteredNodes.slice(offset, offset + limit);
+  const pageIds = new Set(pageNodes.map((n) => n.id));
+  const pageEdges = snap.topEdges.filter(
+    (e) => pageIds.has(e.sourceNodeId) && pageIds.has(e.targetNodeId),
+  );
+  return {
+    nodes: pageNodes,
+    edges: pageEdges,
+    depth: 0,
+    totalNodes: total,
+    totalEdges: snap.stats.totalEdges,
+    truncated: total > pageNodes.length,
+    limit,
+    offset,
+    fromSnapshot: true,
+  };
+}
 
 function resolvePagination(
   rawLimit: number | undefined,
@@ -256,6 +399,13 @@ export function registerGraphFunction(
           edgesExtracted: edges.length,
         });
 
+        // #814: snapshot is now out of date. Mark it dirty and let the
+        // next graph-query / scheduled rebuild pay the enumeration cost
+        // — inlining the rebuild here would slow every extract by O(n).
+        if (nodes.length > 0 || edges.length > 0) {
+          await markSnapshotDirty(kv);
+        }
+
         logger.info("Graph extraction complete", {
           nodes: nodes.length,
           edges: edges.length,
@@ -288,10 +438,67 @@ export function registerGraphFunction(
       limit?: number;
       offset?: number;
     }): Promise<GraphQueryResult> => {
-      const allNodes = (await kv.list<GraphNode>(KV.graphNodes)).filter((n) => !n.stale);
-      const allEdges = (await kv.list<GraphEdge>(KV.graphEdges)).filter((e) => !e.stale);
       const maxDepth = Math.min(data.maxDepth || 3, 5);
       const { limit, offset } = resolvePagination(data.limit, data.offset);
+
+      // #814: the empty-body / nodeType-only branch is the path the
+      // viewer hits on tab load. On large corpora (~75K nodes reported)
+      // the unbounded kv.list pair exceeds the iii invocation timeout
+      // and returns "Invocation stopped". Serve this path from the
+      // precomputed top-degree snapshot when possible.
+      const noWalk = !data.query && !data.startNodeId;
+      if (noWalk) {
+        const snap = await readSnapshot(kv);
+        if (snap && snap.stats.totalNodes > 0) {
+          return paginateFromSnapshot(snap, data.nodeType, limit, offset);
+        }
+      }
+
+      // Race the live enumeration against a wall-clock budget. On
+      // timeout, fall back to the snapshot (even if stale or empty) so
+      // the caller gets an actionable envelope instead of an opaque
+      // 500.
+      let allNodes: GraphNode[];
+      let allEdges: GraphEdge[];
+      try {
+        const [rawNodes, rawEdges] = await withTimeout(
+          Promise.all([
+            kv.list<GraphNode>(KV.graphNodes),
+            kv.list<GraphEdge>(KV.graphEdges),
+          ]),
+          LIVE_ENUMERATION_BUDGET_MS,
+          "graph-query enumeration",
+        );
+        allNodes = rawNodes.filter((n) => !n.stale);
+        allEdges = rawEdges.filter((e) => !e.stale);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.warn("Graph query enumeration timed out, using snapshot", {
+          error: msg,
+        });
+        const snap = await readSnapshot(kv);
+        if (snap) {
+          return {
+            ...paginateFromSnapshot(snap, data.nodeType, limit, offset),
+            warning:
+              "Live graph enumeration exceeded budget; serving from snapshot. " +
+              "Run mem::graph-snapshot-rebuild to refresh.",
+          };
+        }
+        return {
+          nodes: [],
+          edges: [],
+          depth: 0,
+          totalNodes: 0,
+          totalEdges: 0,
+          truncated: false,
+          limit,
+          offset,
+          warning:
+            "Graph enumeration exceeded budget and no snapshot is available. " +
+            "Trigger mem::graph-snapshot-rebuild and retry.",
+        };
+      }
 
       if (data.query) {
         const lower = data.query.toLowerCase();
@@ -359,25 +566,87 @@ export function registerGraphFunction(
     },
   );
 
-  sdk.registerFunction("mem::graph-stats",  async () => {
-    const nodes = await kv.list<GraphNode>(KV.graphNodes);
-    const edges = await kv.list<GraphEdge>(KV.graphEdges);
-
-    const nodesByType: Record<string, number> = {};
-    for (const n of nodes) {
-      nodesByType[n.type] = (nodesByType[n.type] || 0) + 1;
+  // #814: graph-stats serves from the snapshot first. Live enumeration
+  // races a wall-clock budget on cache miss; both timeouts return a
+  // best-effort envelope plus a warning, never a 500.
+  sdk.registerFunction("mem::graph-stats", async () => {
+    const snap = await readSnapshot(kv);
+    if (snap && !snap.dirty) {
+      return { ...snap.stats, fromSnapshot: true, updatedAt: snap.updatedAt };
     }
 
-    const edgesByType: Record<string, number> = {};
-    for (const e of edges) {
-      edgesByType[e.type] = (edgesByType[e.type] || 0) + 1;
+    try {
+      const [nodes, edges] = await withTimeout(
+        Promise.all([
+          kv.list<GraphNode>(KV.graphNodes),
+          kv.list<GraphEdge>(KV.graphEdges),
+        ]),
+        LIVE_ENUMERATION_BUDGET_MS,
+        "graph-stats enumeration",
+      );
+      const built = buildSnapshotFromArrays(nodes, edges);
+      await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, built);
+      return { ...built.stats, fromSnapshot: false, updatedAt: built.updatedAt };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.warn("Graph stats enumeration timed out", { error: msg });
+      if (snap) {
+        return {
+          ...snap.stats,
+          fromSnapshot: true,
+          updatedAt: snap.updatedAt,
+          warning:
+            "Live stats enumeration exceeded budget; serving stale snapshot. " +
+            "Run mem::graph-snapshot-rebuild to refresh.",
+        };
+      }
+      return {
+        totalNodes: 0,
+        totalEdges: 0,
+        nodesByType: {},
+        edgesByType: {},
+        fromSnapshot: false,
+        warning:
+          "Graph stats enumeration exceeded budget and no snapshot is " +
+          "available. Trigger mem::graph-snapshot-rebuild and retry.",
+      };
     }
+  });
 
-    return {
-      totalNodes: nodes.length,
-      totalEdges: edges.length,
-      nodesByType,
-      edgesByType,
-    };
+  // #814: explicit rebuild. Called on-demand from the CLI / viewer when
+  // the user wants to refresh the cached subgraph after a large batch
+  // of mem::graph-extract writes. Pays the full enumeration cost once
+  // and persists the result so subsequent graph-query / graph-stats
+  // calls hit the fast path.
+  sdk.registerFunction("mem::graph-snapshot-rebuild", async () => {
+    const started = Date.now();
+    try {
+      const [nodes, edges] = await Promise.all([
+        kv.list<GraphNode>(KV.graphNodes),
+        kv.list<GraphEdge>(KV.graphEdges),
+      ]);
+      const snap = buildSnapshotFromArrays(nodes, edges);
+      await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, snap);
+      const tookMs = Date.now() - started;
+      logger.info("Graph snapshot rebuilt", {
+        totalNodes: snap.stats.totalNodes,
+        totalEdges: snap.stats.totalEdges,
+        topNodes: snap.topNodes.length,
+        topEdges: snap.topEdges.length,
+        tookMs,
+      });
+      return {
+        success: true,
+        ...snap.stats,
+        topNodes: snap.topNodes.length,
+        topEdges: snap.topEdges.length,
+        updatedAt: snap.updatedAt,
+        tookMs,
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error("Graph snapshot rebuild failed", { error: msg });
+      return { success: false, error: msg };
+    }
   });
 }

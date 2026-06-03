@@ -450,6 +450,33 @@ export interface GraphQueryResult {
   // detect when the default was applied vs an explicit `limit`.
   limit?: number;
   offset?: number;
+  // #814: indicates the response came from the precomputed top-degree
+  // snapshot rather than a live kv.list enumeration. Set only on the
+  // empty-body / nodeType-only branch on large corpora where the
+  // unbounded enumeration would exceed the iii invocation timeout.
+  fromSnapshot?: boolean;
+  // #814: when the snapshot is stale or absent and the live fallback
+  // also failed, expose an explanatory note so the viewer can surface
+  // an actionable banner instead of a blank graph.
+  warning?: string;
+}
+
+// #814: persisted top-degree subgraph + aggregate counts. Stored under
+// KV.graphSnapshot with a single key "current". `dirty` is set true by
+// mem::graph-extract after writes and flipped false when the snapshot
+// rebuild completes.
+export interface GraphSnapshot {
+  version: 1;
+  topNodes: GraphNode[];
+  topEdges: GraphEdge[];
+  stats: {
+    totalNodes: number;
+    totalEdges: number;
+    nodesByType: Record<string, number>;
+    edgesByType: Record<string, number>;
+  };
+  updatedAt: string;
+  dirty: boolean;
 }
 
 export type ConsolidationTier =

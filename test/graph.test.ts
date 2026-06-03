@@ -378,4 +378,142 @@ describe("Graph Functions", () => {
     // totalEdges counts every edge in the full result universe.
     expect(page.totalEdges).toBe(11);
   });
+
+  // #814: precomputed snapshot path. The viewer-tab default-cap query
+  // and graph-stats both have to work at 75K-node scale where the
+  // full kv.list enumeration exceeds the iii invocation budget.
+  describe("snapshot cache (#814)", () => {
+    async function seed(nodeCount: number, edgeCount: number) {
+      for (let i = 0; i < nodeCount; i++) {
+        await kv.set("mem:graph:nodes", `n_${i}`, {
+          id: `n_${i}`,
+          type: i % 3 === 0 ? "file" : "function",
+          name: `node-${i}`,
+          properties: {},
+          sourceObservationIds: [`obs_${i}`],
+          firstSeen: "2026-01-01T00:00:00Z",
+          lastSeen: "2026-01-01T00:00:00Z",
+          observationCount: 1,
+          stale: false,
+        });
+      }
+      for (let i = 0; i < edgeCount; i++) {
+        const src = `n_${i % nodeCount}`;
+        const dst = `n_${(i + 1) % nodeCount}`;
+        await kv.set("mem:graph:edges", `e_${i}`, {
+          id: `e_${i}`,
+          type: i % 2 === 0 ? "uses" : "imports",
+          sourceNodeId: src,
+          targetNodeId: dst,
+          weight: 1,
+          evidence: [],
+          sourceObservationIds: [`obs_${i}`],
+          firstSeen: "2026-01-01T00:00:00Z",
+          lastSeen: "2026-01-01T00:00:00Z",
+          stale: false,
+        });
+      }
+    }
+
+    it("snapshot-rebuild persists top-degree subgraph + aggregate stats", async () => {
+      await seed(50, 100);
+      const result = (await sdk.trigger("mem::graph-snapshot-rebuild", {})) as {
+        success: boolean;
+        totalNodes: number;
+        totalEdges: number;
+        topNodes: number;
+        topEdges: number;
+      };
+      expect(result.success).toBe(true);
+      expect(result.totalNodes).toBe(50);
+      expect(result.totalEdges).toBe(100);
+      // 50 nodes is below the SNAPSHOT_TOP_NODES cap, so every node
+      // lands in the snapshot.
+      expect(result.topNodes).toBe(50);
+
+      const snap = await kv.get<{
+        version: number;
+        topNodes: unknown[];
+        stats: { totalNodes: number; nodesByType: Record<string, number> };
+      }>("mem:graph:snapshot", "current");
+      expect(snap).not.toBeNull();
+      expect(snap!.version).toBe(1);
+      expect(snap!.stats.totalNodes).toBe(50);
+      // nodesByType reflects every type seen.
+      expect(snap!.stats.nodesByType["file"]).toBeGreaterThan(0);
+      expect(snap!.stats.nodesByType["function"]).toBeGreaterThan(0);
+    });
+
+    it("graph-query empty-body branch serves from snapshot once it exists", async () => {
+      await seed(20, 30);
+      await sdk.trigger("mem::graph-snapshot-rebuild", {});
+
+      const result = (await sdk.trigger("mem::graph-query", {})) as GraphQueryResult;
+      expect(result.fromSnapshot).toBe(true);
+      expect(result.totalNodes).toBe(20);
+      expect(result.totalEdges).toBe(30);
+    });
+
+    it("graph-query nodeType filter respects snapshot type counts", async () => {
+      await seed(30, 0);
+      await sdk.trigger("mem::graph-snapshot-rebuild", {});
+
+      const fileQuery = (await sdk.trigger("mem::graph-query", {
+        nodeType: "file",
+      })) as GraphQueryResult;
+      expect(fileQuery.fromSnapshot).toBe(true);
+      // 30 nodes, every 3rd is "file" → 10 files.
+      expect(fileQuery.totalNodes).toBe(10);
+      for (const n of fileQuery.nodes) {
+        expect(n.type).toBe("file");
+      }
+    });
+
+    it("graph-stats returns from snapshot when not dirty", async () => {
+      await seed(15, 25);
+      await sdk.trigger("mem::graph-snapshot-rebuild", {});
+
+      const stats = (await sdk.trigger("mem::graph-stats", {})) as {
+        totalNodes: number;
+        totalEdges: number;
+        fromSnapshot: boolean;
+      };
+      expect(stats.fromSnapshot).toBe(true);
+      expect(stats.totalNodes).toBe(15);
+      expect(stats.totalEdges).toBe(25);
+    });
+
+    it("graph-extract marks snapshot dirty so stale data triggers rebuild", async () => {
+      await seed(10, 10);
+      await sdk.trigger("mem::graph-snapshot-rebuild", {});
+
+      // Run extract — should set dirty=true on the snapshot.
+      await sdk.trigger("mem::graph-extract", { observations: [testObs] });
+
+      const snap = await kv.get<{ dirty: boolean }>(
+        "mem:graph:snapshot",
+        "current",
+      );
+      expect(snap?.dirty).toBe(true);
+    });
+
+    it("graph-stats falls back to live enumeration on first call (no snapshot yet)", async () => {
+      await seed(5, 5);
+
+      const stats = (await sdk.trigger("mem::graph-stats", {})) as {
+        totalNodes: number;
+        totalEdges: number;
+        fromSnapshot: boolean;
+      };
+      // No snapshot existed; the handler built one inline.
+      expect(stats.fromSnapshot).toBe(false);
+      expect(stats.totalNodes).toBe(5);
+      // The inline rebuild persists for subsequent calls.
+      const snap = await kv.get<{ version: number }>(
+        "mem:graph:snapshot",
+        "current",
+      );
+      expect(snap?.version).toBe(1);
+    });
+  });
 });
