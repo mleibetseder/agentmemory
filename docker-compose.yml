@@ -32,7 +32,7 @@ services:
       - HOST=${HOST:-0.0.0.0}
       - PORT=${PORT:-3111}
       - VIEWER_PORT=${VIEWER_PORT:-3113}
-      - AGENTMEMORY_URL=${AGENTMEMORY_URL:-http://localhost:3111}
+      - AGENTMEMORY_URL=${AGENTMEMORY_URL:-http://0.0.0.0:3111}
     ports:
       - "${HOST:-127.0.0.1}:${PORT:-3111}:${PORT:-3111}"
       - "${HOST:-127.0.0.1}:${VIEWER_PORT:-3113}:${VIEWER_PORT:-3113}"
@@ -48,6 +48,14 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  agentmemory:
+    image: registry.leibetseder.io/agentmemory:v0.9.26
+    depends_on:
+      iii-engine:
+        condition: service_started
+    environment:
+      - AGENTMEMORY_URL=${AGENTMEMORY_URL:-http://iii-engine:3111}
 
 volumes:
   iii-data:
